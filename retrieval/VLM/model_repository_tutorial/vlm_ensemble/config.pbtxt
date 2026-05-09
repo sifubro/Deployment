@@ -1,0 +1,100 @@
+# =============================================================================
+# vlm_ensemble  —  the public endpoint
+# -----------------------------------------------------------------------------
+# Wires the 5 models above into a single virtual model. Clients call
+# `vlm_ensemble`; Triton pipes tensors GPU-to-GPU between steps with no
+# extra serialisation, no network hops, and no client-side orchestration.
+#
+# An ensemble has NO weights — `1/` exists but is empty (or absent). The
+# scheduling block below IS the model.
+# =============================================================================
+
+name: "vlm_ensemble"
+
+# Special platform value — Triton's ensemble scheduler instead of a
+# framework backend.
+platform: "ensemble"
+
+# The outer batch size — must be ≤ the smallest `max_batch_size` of any
+# step in the pipeline. (Here, vlm_preprocess and vlm_llm_decoder are 0;
+# vision_encoder is 32; text_encoder is 64; postprocess is 64.) Steps
+# with `max_batch_size: 0` accept any batch — they don't constrain the
+# ensemble.
+max_batch_size: 32
+
+input [
+  { name: "image_bytes"  data_type: TYPE_STRING  dims: [ 1 ] },
+  { name: "prompt"       data_type: TYPE_STRING  dims: [ 1 ]  optional: true }
+]
+
+output [
+  { name: "text"      data_type: TYPE_STRING  dims: [ 1 ] },
+  { name: "is_final"  data_type: TYPE_BOOL    dims: [ 1 ] }
+]
+
+# =============================================================================
+# Because vlm_llm_decoder is decoupled (token streaming), the ensemble
+# itself MUST be decoupled too — otherwise Triton refuses to load it.
+# =============================================================================
+model_transaction_policy {
+  decoupled: true
+}
+
+ensemble_scheduling {
+  # `step` is a list of stages. Triton resolves the DAG from input_map /
+  # output_map (NOT from list order) — a stage runs as soon as all its
+  # inputs are produced. Independent stages run in parallel.
+  step [
+    {
+      model_name: "vlm_preprocess"
+      # `-1` = "use whatever this model's `version_policy` says is current"
+      # (typically `latest`). Pin to a specific number for canarying.
+      model_version: -1
+      # input_map  : { key: <name in inner model> value: <name in outer / DAG> }
+      # output_map : { key: <name in inner model> value: <name in outer / DAG> }
+      # The OUTER name is either:
+      #   - one of this ensemble's `input`/`output` names, or
+      #   - an intermediate tensor name shared across steps.
+      input_map  { key: "image_bytes" value: "image_bytes" }
+      input_map  { key: "prompt"      value: "prompt"      }
+      output_map { key: "pixel_values"   value: "tmp_pixel_values" }
+      output_map { key: "input_ids"      value: "tmp_input_ids" }
+      output_map { key: "attention_mask" value: "tmp_attention_mask" }
+    },
+    {
+      model_name: "vlm_vision_encoder"
+      model_version: -1
+      input_map  { key: "pixel_values"   value: "tmp_pixel_values" }
+      output_map { key: "image_features" value: "tmp_image_features" }
+    },
+    {
+      # Runs in parallel with vlm_vision_encoder — different inputs,
+      # no dependency between them.
+      model_name: "vlm_text_encoder"
+      model_version: -1
+      input_map  { key: "input_ids"      value: "tmp_input_ids" }
+      input_map  { key: "attention_mask" value: "tmp_attention_mask" }
+      output_map { key: "text_embeds"    value: "tmp_text_embeds" }
+    },
+    {
+      model_name: "vlm_llm_decoder"
+      model_version: -1
+      input_map  { key: "image_features" value: "tmp_image_features" }
+      input_map  { key: "input_ids"      value: "tmp_input_ids" }
+      output_map { key: "output_token_ids" value: "tmp_output_token_ids" }
+      # Bubble `is_final` straight up to the ensemble's output of the
+      # same name — clients see it without postprocess having to forward.
+      output_map { key: "is_final"         value: "is_final" }
+    },
+    {
+      model_name: "vlm_postprocess"
+      model_version: -1
+      input_map  { key: "token_ids" value: "tmp_output_token_ids" }
+      output_map { key: "text"      value: "text" }
+    }
+  ]
+}
+
+# Ensembles inherit no scheduler config from their steps — they have no
+# dynamic_batching of their own. Each step batches independently, so
+# you tune throughput at the step level, not here.

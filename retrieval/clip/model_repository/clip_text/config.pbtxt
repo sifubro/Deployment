@@ -1,0 +1,15 @@
+name: "clip_text"
+platform: "pytorch_libtorch"
+max_batch_size: 64
+input [
+  { name: "input_ids"       data_type: TYPE_INT64  dims: [ 77 ] },
+  { name: "attention_mask"  data_type: TYPE_INT64  dims: [ 77 ] }
+]
+output [
+  { name: "embedding"  data_type: TYPE_FP32  dims: [ 512 ] }
+]
+instance_group [ { count: 1  kind: KIND_GPU } ]
+dynamic_batching {
+  preferred_batch_size: [ 16, 32, 64 ]
+  max_queue_delay_microseconds: 5000
+}

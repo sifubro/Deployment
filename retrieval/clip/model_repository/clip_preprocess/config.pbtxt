@@ -1,0 +1,10 @@
+name: "clip_preprocess"
+backend: "python"
+max_batch_size: 0
+input [
+  { name: "image_bytes"  data_type: TYPE_STRING  dims: [ 1 ] }
+]
+output [
+  { name: "pixel_values"  data_type: TYPE_FP32  dims: [ 3, 224, 224 ] }
+]
+instance_group [ { count: 2  kind: KIND_CPU } ]

@@ -1,0 +1,143 @@
+# =============================================================================
+# clip_text_encoder  —  ONNX Runtime + TensorRT execution provider, GPU
+# -----------------------------------------------------------------------------
+# CLIP text tower exported to ONNX. We let ORT route supported subgraphs
+# to TensorRT and fall back to the CUDA EP for the rest — TRT speedups
+# without TRT's brittleness around unsupported ops.
+#
+# Output is L2-normalised inside the exported graph (same contract as
+# the image encoder). Keep dim and `is_normalized` parameters in sync
+# between the two encoders so vector-DB code can stay generic.
+# =============================================================================
+
+name: "clip_text_encoder"
+platform: "onnxruntime_onnx"
+
+# Text encoder is smaller than the image encoder → bigger batches fit.
+# 128 is comfortable on a T4 with FP16; raise to 256 on A10+.
+max_batch_size: 128
+
+input [
+  {
+    name: "input_ids"
+    data_type: TYPE_INT64
+    # 77 = CLIP's hard-coded context length, ALWAYS this. NEVER `-1` for
+    # CLIP text — the TRT engine is built against this exact shape and
+    # variable lengths just trigger a rebuild penalty.
+    dims: [ 77 ]
+    # `allow_ragged_batch` does NOT apply here. CLIP pads to 77 by
+    # construction — there's no length variance to exploit. (Ragged
+    # batching is for transformer encoders with genuinely variable seq
+    # length like BERT-for-search.)
+  },
+  {
+    name: "attention_mask"
+    data_type: TYPE_INT64
+    dims: [ 77 ]
+  }
+]
+
+output [
+  {
+    name: "embedding"
+    data_type: TYPE_FP32
+    dims: [ 512 ]
+  }
+]
+
+instance_group [
+  { count: 1  kind: KIND_GPU  gpus: [ 0 ] }
+]
+
+dynamic_batching {
+  preferred_batch_size: [ 16, 32, 64, 128 ]
+  # Text queries are super interactive (search-as-you-type), so the
+  # queue delay must be tight. 2 ms = ~500 batched-flushes/s upper bound,
+  # well above any realistic single-replica QPS.
+  max_queue_delay_microseconds: 2000
+  priority_levels: 2
+  default_priority_level: 2
+  default_queue_policy {
+    timeout_action: REJECT
+    default_timeout_microseconds: 500000   # 500 ms
+    allow_timeout_override: true
+    max_queue_size: 512
+  }
+}
+
+# =============================================================================
+# Optimisation block.
+# =============================================================================
+optimization {
+  # ORT graph-optimisation level:
+  #   -1 default | 0 disabled | 1 basic | 2 extended | 99 all
+  graph { level: 1 }
+
+  # ----- TensorRT execution provider --------------------------------------
+  # ORT will offload supported subgraphs to TRT and fall back to the CUDA
+  # EP for the rest. Engine is built lazily on first request, then cached.
+  # ------------------------------------------------------------------------
+  execution_accelerators {
+    gpu_execution_accelerator: [
+      {
+        name: "tensorrt"
+        # Precision: FP32 | FP16 | INT8.
+        # FP16 is the sweet spot for CLIP — virtually no accuracy hit on
+        # ImageNet-Captions / MS-COCO retrieval, ~2× throughput vs FP32.
+        # INT8 needs a calibration cache (run `trtexec --int8 --calib=...`
+        # offline) and a held-out validation pass to confirm Recall@K
+        # didn't regress.
+        parameters { key: "precision_mode"          value: "FP16" }
+        parameters { key: "max_workspace_size_bytes" value: "1073741824" }   # 1 GiB
+        # Engine build can take 1–10 minutes — never let it block first-
+        # request latency. Cache key includes precision + input shapes,
+        # so this survives container restarts.
+        parameters { key: "trt_engine_cache_enable" value: "true" }
+        parameters { key: "trt_engine_cache_path"   value: "/models/clip_text_encoder/trt_cache" }
+        # For INT8:
+        # parameters { key: "trt_int8_enable"       value: "true" }
+        # parameters { key: "trt_int8_calibration_table_name" value: "calib.cache" }
+      }
+    ]
+  }
+
+  input_pinned_memory  { enable: true }
+  output_pinned_memory { enable: true }
+}
+
+# ORT session options. Threading: 1 thread per session is correct for
+# GPU work; Triton parallelises across requests via `instance_group`.
+parameters: { key: "intra_op_thread_count" value: { string_value: "1" } }
+parameters: { key: "inter_op_thread_count" value: { string_value: "1" } }
+parameters: { key: "execution_mode"        value: { string_value: "0" } }   # 0=SEQUENTIAL, 1=PARALLEL
+parameters: { key: "enable_mem_pattern"    value: { string_value: "true" } }
+
+model_warmup [
+  { name: "warmup_b1"   batch_size: 1   count: 2
+    inputs {
+      key: "input_ids"      value { data_type: TYPE_INT64  dims: [77]  zero_data: true } }
+    inputs {
+      key: "attention_mask" value { data_type: TYPE_INT64  dims: [77]  zero_data: true } } },
+  { name: "warmup_b32"  batch_size: 32  count: 2
+    inputs {
+      key: "input_ids"      value { data_type: TYPE_INT64  dims: [77]  zero_data: true } }
+    inputs {
+      key: "attention_mask" value { data_type: TYPE_INT64  dims: [77]  zero_data: true } } },
+  { name: "warmup_b128" batch_size: 128 count: 2
+    inputs {
+      key: "input_ids"      value { data_type: TYPE_INT64  dims: [77]  zero_data: true } }
+    inputs {
+      key: "attention_mask" value { data_type: TYPE_INT64  dims: [77]  zero_data: true } } }
+]
+
+# Text queries repeat A LOT in production search ("red dress", "summer
+# shoes") — text embedding cache hit rate is consistently 30–60% on
+# real e-commerce traffic. Definitely enable.
+response_cache { enable: true }
+
+version_policy { latest { num_versions: 1 } }
+
+parameters: { key: "stage"          value: { string_value: "encode" } }
+parameters: { key: "modality"       value: { string_value: "text" } }
+parameters: { key: "embedding_dim"  value: { string_value: "512" } }
+parameters: { key: "is_normalized"  value: { string_value: "true" } }

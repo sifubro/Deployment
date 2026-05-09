@@ -1,0 +1,118 @@
+# =============================================================================
+# clip_router  —  Business Logic Scripting (BLS), Python backend
+# -----------------------------------------------------------------------------
+# Single endpoint that accepts EITHER image_bytes OR text and dispatches
+# to the right ensemble. This is the canonical use case for BLS:
+# data-dependent control flow that an `ensemble` config can't express.
+#
+# How BLS works: the config.pbtxt below looks identical to any other
+# Python backend. The "BLS-ness" lives in `1/model.py`, which calls
+# other Triton models from inside `execute()`:
+#
+#   import triton_python_backend_utils as pb_utils
+#
+#   def execute(self, requests):
+#       responses = []
+#       for request in requests:
+#           img = pb_utils.get_input_tensor_by_name(request, "image_bytes")
+#           txt = pb_utils.get_input_tensor_by_name(request, "text")
+#           if img is not None:
+#               inner = pb_utils.InferenceRequest(
+#                   model_name="clip_image_ensemble",
+#                   inputs=[pb_utils.Tensor("image_bytes", img.as_numpy())],
+#                   requested_output_names=["embedding"])
+#               inner_resp = inner.exec()       # synchronous; .async_exec() exists too
+#               emb = pb_utils.get_output_tensor_by_name(inner_resp, "embedding")
+#               modality_out = "image"
+#           elif txt is not None:
+#               inner = pb_utils.InferenceRequest(
+#                   model_name="clip_text_ensemble",
+#                   inputs=[pb_utils.Tensor("text", txt.as_numpy())],
+#                   requested_output_names=["embedding"])
+#               inner_resp = inner.exec()
+#               emb = pb_utils.get_output_tensor_by_name(inner_resp, "embedding")
+#               modality_out = "text"
+#           else:
+#               raise pb_utils.TritonModelException("supply image_bytes or text")
+#           responses.append(pb_utils.InferenceResponse(
+#               output_tensors=[
+#                   emb,
+#                   pb_utils.Tensor("modality", np.array([modality_out], dtype=object))
+#               ]))
+#       return responses
+#
+# Ensemble vs. BLS at a glance:
+#                    Ensemble                BLS
+#   defined by       static DAG in pbtxt     imperative Python
+#   branching        no                       yes
+#   variable steps   no                       yes
+#   latency cost     lowest                   slightly higher (Python hop)
+#   when to use      fixed pipeline           if/else, retries, fan-out
+# =============================================================================
+
+name: "clip_router"
+backend: "python"
+
+# `max_batch_size: 0` — the router pulls one request at a time, decides
+# which ensemble to call, and dispatches. There's no upside to batching
+# here because the inner ensemble has its own dynamic_batching that picks
+# up requests from many concurrent BLS instances.
+max_batch_size: 0
+
+input [
+  {
+    name: "image_bytes"
+    data_type: TYPE_STRING
+    dims: [ 1 ]
+    # `optional: true` means clients may omit this input entirely. The
+    # BLS code in model.py reads `get_input_tensor_by_name` and handles
+    # the None case to branch.
+    optional: true
+  },
+  {
+    name: "text"
+    data_type: TYPE_STRING
+    dims: [ 1 ]
+    optional: true
+  }
+]
+
+output [
+  {
+    name: "embedding"
+    data_type: TYPE_FP32
+    dims: [ 512 ]
+  },
+  {
+    # Tells the client which path served the request. Useful for
+    # client-side metrics and debugging.
+    name: "modality"
+    data_type: TYPE_STRING
+    dims: [ 1 ]
+  }
+]
+
+instance_group [
+  {
+    # The router's own work is microsecond-scale (just dispatch). 4 CPU
+    # instances comfortably handle thousands of concurrent in-flight
+    # requests since they're all blocked on `inner.exec()`.
+    count: 4
+    kind: KIND_CPU
+  }
+]
+
+# `parameters` let the router decide which inner ensembles to call without
+# code changes. Useful for blue/green: launch `clip_image_ensemble_v2`
+# alongside `clip_image_ensemble`, flip the parameter, redeploy.
+parameters: { key: "IMAGE_MODEL"  value: { string_value: "clip_image_ensemble" } }
+parameters: { key: "TEXT_MODEL"   value: { string_value: "clip_text_ensemble"  } }
+
+# Don't cache here — the inner ensembles already have response_cache on,
+# and caching at the router level would double-store the result.
+response_cache { enable: false }
+
+# Router code rarely changes; keep just the latest.
+version_policy { latest { num_versions: 1 } }
+
+parameters: { key: "stage" value: { string_value: "router" } }

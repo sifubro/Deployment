@@ -1,0 +1,234 @@
+# =============================================================================
+# vlm_vision_encoder  —  TorchScript (`pytorch_libtorch`), GPU
+# -----------------------------------------------------------------------------
+# Traced ViT (or CLIP image encoder) that converts pixel_values into the
+# image_features the LLM decoder cross-attends to. This file is the most
+# important one to study — it shows every dynamic-batching, priority,
+# CUDA-graph, warmup, and pinned-memory knob.
+# =============================================================================
+
+name: "vlm_vision_encoder"
+
+# `platform` (not `backend`) for "known" framework runtimes. Triton picks
+# the right backend .so by file convention:
+#   pytorch_libtorch       -> 1/model.pt   (TorchScript)
+#   onnxruntime_onnx       -> 1/model.onnx
+#   tensorrt_plan          -> 1/model.plan
+#   tensorflow_savedmodel  -> 1/model.savedmodel/
+#   tensorflow_graphdef    -> 1/model.graphdef
+#   ensemble               -> no weights, just config
+platform: "pytorch_libtorch"
+
+# Hard cap on batch size. Triton refuses larger requests at the API edge;
+# smaller ones are grouped by `dynamic_batching` below. Pick the largest
+# batch that fits in GPU memory at PEAK input shape — too high triggers
+# OOM under load (not at startup).
+max_batch_size: 32
+
+input [
+  {
+    name: "pixel_values"
+    data_type: TYPE_FP32
+    # `format` is metadata. It tells Perf Analyzer how to interpret the
+    # tensor as an image and lets clients send NHWC and have Triton
+    # transpose for them.
+    #   FORMAT_NONE | FORMAT_NCHW | FORMAT_NHWC
+    format: FORMAT_NCHW
+    dims: [ 3, 224, 224 ]
+    # Other input fields you might use here:
+    #   reshape { shape: [3, 224, 224] }      # client view ↔ model view differ
+    #   is_shape_tensor: true                  # TRT shape tensors only
+    #   allow_ragged_batch: true               # stack different-length inputs
+  }
+]
+
+output [
+  {
+    name: "image_features"
+    data_type: TYPE_FP32
+    # 257 = (14*14 patch tokens + 1 CLS) for a 224 px ViT @ patch=16.
+    # 768 = hidden dim. Declare the exact shape — the ensemble can then
+    # validate the LLM decoder's input shape at config-load.
+    dims: [ 257, 768 ]
+  }
+]
+
+instance_group [
+  {
+    # 2 copies on the GPU. Only useful when ONE instance leaves the GPU
+    # under-utilised at peak load. Each copy duplicates weights —
+    # measure with `nvidia-smi dmon -s mu` before bumping.
+    count: 2
+    kind: KIND_GPU
+    # Pin to specific devices on multi-tenant boxes. Default = all visible.
+    gpus: [ 0 ]
+    # `profile: ["fast"]` selects a TensorRT optimisation profile by name
+    # when this model has multiple. (TRT plans only; ignored here.)
+    # `rate_limiter` cooperatively schedules across models that share a
+    # finite resource — useful when several models compete for GPU memory.
+    # rate_limiter {
+    #   resources [{ name: "GPU_MEMORY"  count: 4096 }]   # MiB
+    #   priority: 1
+    # }
+  }
+]
+
+# =============================================================================
+# Dynamic batching — the single biggest throughput knob in Triton.
+# =============================================================================
+# Triton holds incoming requests for up to `max_queue_delay_microseconds`,
+# trying to assemble a batch close to one of `preferred_batch_size`, then
+# dispatches as a single forward pass.
+dynamic_batching {
+  # Batch sizes the scheduler aims for. Set these to the sizes you've
+  # actually benchmarked — typically the ones where GPU utilisation
+  # plateaus. Triton WILL execute non-preferred sizes if the queue empties
+  # before the deadline, so don't worry about gaps.
+  preferred_batch_size: [ 8, 16, 32 ]
+
+  # Hard cap on how long we'll wait to grow a batch before firing.
+  #   1 ms     — interactive / single-user
+  #   5 ms     — balanced (this default)
+  #   50–100ms — bulk / batch jobs
+  max_queue_delay_microseconds: 5000
+
+  # Return responses in arrival order even when batched out-of-order.
+  # Costs ~1–5% throughput; turn on only if downstream actually depends
+  # on it. (Token-streaming clients usually do NOT.)
+  preserve_ordering: false
+
+  # Multi-class scheduling. Lower number = higher priority.
+  # Clients pass `priority` in the inference header; we use 2 levels here:
+  #   1 = interactive    (user-facing UI)
+  #   2 = bulk           (offline embedding, default)
+  priority_levels: 2
+  default_priority_level: 2
+
+  # Per-priority queue policy. Without this, queues grow unbounded under
+  # overload and latency tails explode.
+  default_queue_policy {
+    # REJECT  → respond with error after timeout (fail-fast, recommended)
+    # DELAY   → still execute but flag the response as late
+    timeout_action: REJECT
+    default_timeout_microseconds: 1000000   # 1 s
+    # Let clients shorten the deadline via `timeout` request header.
+    allow_timeout_override: true
+    # Back-pressure: the (max_queue_size+1)th queued request fails
+    # immediately instead of waiting. Pick a value matched to your SLA
+    # (queue_size * avg_batch_latency ≈ p99 wait time).
+    max_queue_size: 256
+  }
+
+  # priority_queue_policy { ... } — per-level overrides if the bulk
+  # queue should tolerate longer waits than the interactive queue.
+}
+
+# =============================================================================
+# Optimisation block — backend-specific tuning.
+# =============================================================================
+optimization {
+  # Backend graph optimiser level. Meaning is backend-specific:
+  #   ORT:   -1 default | 0 disabled | 1 basic | 2 extended | 99 all
+  #   TRT:   ignored
+  #   Torch: ignored (use torch.jit.optimize_for_inference at export time)
+  graph { level: 1 }
+
+  # Runtime priority (passed to the OS scheduler / CUDA streams).
+  # PRIORITY_DEFAULT | PRIORITY_MAX | PRIORITY_MIN
+  priority: PRIORITY_DEFAULT
+
+  # CUDA graphs eliminate per-launch kernel overhead — big win for small
+  # batches and short kernels. NOT supported by models with data-dependent
+  # control flow or shapes that vary outside `graph_spec`. Always measure
+  # both ways; sometimes graphs hurt for very large kernels.
+  cuda {
+    graphs: true
+    # Graphs are shape-specialised, so capture one per batch size you
+    # actually serve. Missing sizes fall back to non-graph execution.
+    graph_spec [
+      { batch_size: 1 },
+      { batch_size: 8 },
+      { batch_size: 16 },
+      { batch_size: 32 }
+    ]
+    # Spin instead of blocking on event-completion. Reduces tail latency
+    # at the cost of a busy CPU core.
+    busy_wait_events: true
+    # Use a separate stream for D2H output copies — overlaps next batch's
+    # H2D copy with the previous batch's output drain.
+    output_copy_stream: true
+  }
+
+  # Pinned (page-locked) host memory enables async H2D/D2H DMA. Default
+  # ON. Disable only if you're tight on host RAM (each enabled buffer
+  # holds onto host RAM for the lifetime of the model).
+  input_pinned_memory  { enable: true }
+  output_pinned_memory { enable: true }
+
+  # When assembling a batch on the GPU, Triton can either:
+  #   - issue one cudaMemcpy per request (low overhead, slow for many small)
+  #   - launch a gather kernel (high overhead, fast for many small)
+  # Threshold = number of requests above which the gather kernel kicks in.
+  # 0 disables gather entirely.
+  gather_kernel_buffer_threshold: 0
+}
+
+# =============================================================================
+# Model warmup — run synthetic requests at LOAD time so the first real
+# request doesn't pay the cost of CUDA graph capture, JIT compilation, or
+# weight materialisation. Without this, your p99 latency briefly spikes
+# every time a new instance comes up after a deploy.
+# =============================================================================
+model_warmup [
+  {
+    name: "warmup_batch1"
+    batch_size: 1
+    count: 2                  # run twice — first run captures, second validates
+    inputs {
+      key: "pixel_values"
+      value {
+        data_type: TYPE_FP32
+        dims: [ 3, 224, 224 ]
+        # Synthetic data. Use `input_data_file: "warmup.bin"` for a
+        # realistic distribution if your model has data-dependent paths.
+        random_data: true
+        # Other options:
+        #   zero_data: true
+        #   input_data_file: "warmup.bin"
+      }
+    }
+  },
+  {
+    name: "warmup_batch_max"
+    batch_size: 32
+    count: 2
+    inputs {
+      key: "pixel_values"
+      value { data_type: TYPE_FP32  dims: [ 3, 224, 224 ]  random_data: true }
+    }
+  }
+]
+
+# Response cache: identical inputs → cached output. Image embeddings ARE
+# deterministic, so this is safe in principle, but cache hit-rate for
+# image bytes is usually near-zero in production. Enable per-stage where
+# it makes sense (postprocess) rather than blanket.
+response_cache { enable: false }
+
+# Keep the previous version loaded too so you can do per-request canary
+# routing. Costs ~1× model memory per extra version.
+version_policy { latest { num_versions: 2 } }
+
+# `default_model_filename` overrides the file Triton looks for in `1/`
+# (default `model.pt` for pytorch_libtorch). Useful when you ship multiple
+# variants in the same directory.
+# default_model_filename: "vit_b16.pt"
+
+# `cc_model_filenames` selects different files per GPU compute capability.
+# Ship one TRT plan per architecture (sm_80, sm_86, sm_90) and Triton
+# loads the right one for each device.
+# cc_model_filenames [
+#   { key: "8.0" value: "model_a100.plan" },
+#   { key: "8.6" value: "model_a10.plan"  },
+#   { key: "9.0" value: "model_h100.plan" }
+# ]

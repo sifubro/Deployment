@@ -1,0 +1,14 @@
+name: "clip_image"
+platform: "pytorch_libtorch"
+max_batch_size: 32
+input [
+  { name: "pixel_values"  data_type: TYPE_FP32  dims: [ 3, 224, 224 ] }
+]
+output [
+  { name: "embedding"  data_type: TYPE_FP32  dims: [ 512 ] }
+]
+instance_group [ { count: 1  kind: KIND_GPU } ]
+dynamic_batching {
+  preferred_batch_size: [ 8, 16, 32 ]
+  max_queue_delay_microseconds: 5000
+}

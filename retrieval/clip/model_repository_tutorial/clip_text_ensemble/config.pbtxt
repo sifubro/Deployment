@@ -1,0 +1,51 @@
+# =============================================================================
+# clip_text_ensemble  —  end-to-end text-to-embedding endpoint
+# -----------------------------------------------------------------------------
+# The public-facing text path. Same pattern as clip_image_ensemble but
+# wires the text preprocess → text encoder. Both ensembles share the same
+# output contract (`embedding [512] FP32`), so vector-DB code can be
+# modality-agnostic.
+# =============================================================================
+
+name: "clip_text_ensemble"
+platform: "ensemble"
+
+# Match the encoder's max batch — the text encoder is small enough to
+# handle 128 comfortably.
+max_batch_size: 128
+
+input [
+  { name: "text"      data_type: TYPE_STRING dims: [ 1 ] }
+]
+output [
+  { name: "embedding" data_type: TYPE_FP32   dims: [ 512 ] }
+]
+
+ensemble_scheduling {
+  step [
+    {
+      model_name: "clip_text_preprocess"
+      model_version: -1
+      input_map  { key: "text"           value: "text" }
+      output_map { key: "input_ids"      value: "tmp_input_ids" }
+      output_map { key: "attention_mask" value: "tmp_attention_mask" }
+    },
+    {
+      model_name: "clip_text_encoder"
+      model_version: -1
+      input_map  { key: "input_ids"      value: "tmp_input_ids" }
+      input_map  { key: "attention_mask" value: "tmp_attention_mask" }
+      output_map { key: "embedding"      value: "embedding" }
+    }
+  ]
+}
+
+# Text query repetition is enormous in real workloads — consistently
+# 30–60% cache hit rate on e-commerce search logs. Cache the full
+# pipeline so popular queries return instantly without touching the
+# tokeniser OR the encoder.
+response_cache { enable: true }
+
+version_policy { latest { num_versions: 1 } }
+
+parameters: { key: "modality" value: { string_value: "text" } }

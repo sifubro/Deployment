@@ -1,0 +1,176 @@
+# =============================================================================
+# clip_image_encoder  —  TorchScript (`pytorch_libtorch`), GPU
+# -----------------------------------------------------------------------------
+# Traced CLIP vision tower + visual_projection. Outputs an L2-normalised
+# 512-D embedding ready for cosine-similarity vector search.
+#
+# IMPORTANT: the L2 normalisation MUST happen inside the traced module —
+# Triton has no "normalise this output" hook. If your model returns raw
+# features, your embeddings won't be cosine-comparable downstream.
+# =============================================================================
+
+name: "clip_image_encoder"
+
+# `platform` (not `backend`) for "known" framework runtimes. Triton picks
+# the backend .so by file convention:
+#   pytorch_libtorch       -> 1/model.pt   (TorchScript)
+#   onnxruntime_onnx       -> 1/model.onnx
+#   tensorrt_plan          -> 1/model.plan
+#   tensorflow_savedmodel  -> 1/model.savedmodel/
+platform: "pytorch_libtorch"
+
+# Largest batch we'll ever group. Higher = better GPU utilisation but
+# more memory at peak shape. CLIP ViT-B/32 is small enough that 64 fits
+# easily on a T4. For ViT-L/14 drop to 16–32.
+max_batch_size: 64
+
+input [
+  {
+    name: "pixel_values"
+    data_type: TYPE_FP32
+    # FORMAT_NCHW is metadata that Perf Analyzer uses to interpret this
+    # tensor as an image. Lets clients send NHWC and have Triton
+    # transpose. The actual tensor still arrives in NCHW layout.
+    format: FORMAT_NCHW
+    dims: [ 3, 224, 224 ]
+  }
+]
+
+output [
+  {
+    name: "embedding"
+    data_type: TYPE_FP32
+    dims: [ 512 ]   # 768 for ViT-L/14 — adjust per CLIP variant
+  }
+]
+
+# =============================================================================
+# Instance groups — ONE PER GPU when you want to use multiple devices.
+# Triton rounds-robins requests across instance_group entries.
+# =============================================================================
+instance_group [
+  {
+    count: 1
+    kind: KIND_GPU
+    gpus: [ 0 ]
+    # `name` is optional but useful for logs and metric labels when you
+    # have many groups with different purposes.
+    name: "gpu0_batched"
+  },
+  {
+    count: 1
+    kind: KIND_GPU
+    gpus: [ 1 ]
+    name: "gpu1_batched"
+  }
+  # Single-GPU box? Drop the second entry. Don't add a third copy on the
+  # same GPU unless `nvidia-smi dmon -s mu` shows util < 80% at peak.
+]
+
+# =============================================================================
+# Dynamic batching — biggest throughput knob. Triton waits up to
+# `max_queue_delay_microseconds` to fill a batch close to one of
+# `preferred_batch_size`, then dispatches the whole batch.
+# =============================================================================
+dynamic_batching {
+  preferred_batch_size: [ 8, 16, 32, 64 ]
+
+  # 5 ms is the right balance for embedding APIs called by interactive
+  # clients (search frontends). Drop to 1 ms for sub-100ms p99 SLAs;
+  # raise to 50 ms for offline indexing pipelines that don't care.
+  max_queue_delay_microseconds: 5000
+
+  # OFF: returning embeddings out of arrival order is fine — clients key
+  # by request id, not by stream position. Saves a few % throughput.
+  preserve_ordering: false
+
+  # Two priority lanes. Real-time search frontend gets priority 1;
+  # bulk re-indexing gets priority 2 (the default). Bulk traffic can't
+  # starve interactive traffic under load.
+  priority_levels: 2
+  default_priority_level: 2
+
+  default_queue_policy {
+    # REJECT under timeout — fail fast so the client can fall back or retry.
+    timeout_action: REJECT
+    default_timeout_microseconds: 1000000   # 1 s
+    allow_timeout_override: true
+    # Back-pressure: 257th queued request fails immediately. Tune so that
+    #   max_queue_size * avg_batch_latency  ≤  your p99 SLA budget.
+    max_queue_size: 256
+  }
+}
+
+# =============================================================================
+# Optimisation block — backend-specific tuning.
+# =============================================================================
+optimization {
+  # Backend graph optimiser level (Torch ignores this; ORT uses it).
+  graph { level: 1 }
+
+  # CUDA graphs eliminate per-launch kernel overhead — big win for
+  # CLIP-sized models where each request is a few thousand small kernels.
+  cuda {
+    graphs: true
+    # Capture one graph per batch size you actually serve. Missing sizes
+    # fall back to non-graph execution (slower but still correct).
+    graph_spec [
+      { batch_size: 1 },
+      { batch_size: 8 },
+      { batch_size: 16 },
+      { batch_size: 32 },
+      { batch_size: 64 }
+    ]
+    busy_wait_events: true       # spin instead of blocking on event-completion
+    output_copy_stream: true     # overlap next H2D with previous D2H drain
+  }
+
+  input_pinned_memory  { enable: true }
+  output_pinned_memory { enable: true }
+}
+
+# =============================================================================
+# Model warmup — runs synthetic requests at LOAD time so the first real
+# request doesn't pay CUDA-graph capture / JIT compilation cost. MANDATORY
+# when `cuda.graphs: true` — without warmup, the first user request after
+# a deploy spikes p99 by hundreds of milliseconds.
+# =============================================================================
+model_warmup [
+  { name: "warmup_b1"   batch_size: 1   count: 2
+    inputs { key: "pixel_values" value { data_type: TYPE_FP32 dims: [3,224,224] random_data: true } } },
+  { name: "warmup_b8"   batch_size: 8   count: 2
+    inputs { key: "pixel_values" value { data_type: TYPE_FP32 dims: [3,224,224] random_data: true } } },
+  { name: "warmup_b32"  batch_size: 32  count: 2
+    inputs { key: "pixel_values" value { data_type: TYPE_FP32 dims: [3,224,224] random_data: true } } },
+  { name: "warmup_b64"  batch_size: 64  count: 2
+    inputs { key: "pixel_values" value { data_type: TYPE_FP32 dims: [3,224,224] random_data: true } } }
+]
+
+# =============================================================================
+# Response cache: ON for the encoder.
+# =============================================================================
+# Image embeddings ARE deterministic — same pixel_values always produce
+# the same vector. In a product catalogue, the same N popular SKU images
+# are queried repeatedly during re-rankings → high hit rate, big saving.
+# Server must be started with `--cache-config=local,size=...`.
+response_cache { enable: true }
+
+# Keep the previous version loaded for blue/green canary rollouts.
+# Costs ~1× model memory per extra version.
+version_policy { latest { num_versions: 2 } }
+
+# Per-arch model files. Useful when you ship one TRT plan per GPU SKU
+# (sm_75 = T4, sm_80 = A100, sm_86 = A10, sm_89 = L4, sm_90 = H100).
+# default_model_filename: "model_a10.pt"
+# cc_model_filenames [
+#   { key: "7.5"  value: "model_t4.pt"   },
+#   { key: "8.0"  value: "model_a100.pt" },
+#   { key: "8.6"  value: "model_a10.pt"  },
+#   { key: "8.9"  value: "model_l4.pt"   },
+#   { key: "9.0"  value: "model_h100.pt" }
+# ]
+
+parameters: { key: "stage"          value: { string_value: "encode" } }
+parameters: { key: "modality"       value: { string_value: "image" } }
+parameters: { key: "embedding_dim"  value: { string_value: "512" } }
+parameters: { key: "is_normalized"  value: { string_value: "true" } }

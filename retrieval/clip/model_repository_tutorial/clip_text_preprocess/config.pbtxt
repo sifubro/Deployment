@@ -1,0 +1,78 @@
+# =============================================================================
+# clip_text_preprocess  —  Python backend, CPU
+# -----------------------------------------------------------------------------
+# Runs CLIPTokenizer (BPE) on the input text. Output is two INT64 tensors
+# of length 77 — CLIP's hard-coded context length — ready for the text
+# encoder.
+#
+# Tokenisation is *much* faster than image decoding (microseconds vs
+# milliseconds), so this stage runs more instances at lower batch sizes
+# than the image preprocess.
+# =============================================================================
+
+name: "clip_text_preprocess"
+backend: "python"
+
+# Tokenisation IS easy to batch — same op, same shape regardless of
+# input length (CLIP pads everything to 77). Set a real max batch so
+# the dynamic batcher can group queries.
+max_batch_size: 256
+
+input [
+  {
+    name: "text"
+    data_type: TYPE_STRING
+    dims: [ 1 ]
+  }
+]
+
+output [
+  {
+    name: "input_ids"
+    data_type: TYPE_INT64
+    # 77 is CLIP's hard-coded context window. Always declare it exactly
+    # — never `-1`. The encoder's TRT engine is built against this.
+    dims: [ 77 ]
+  },
+  {
+    name: "attention_mask"
+    data_type: TYPE_INT64
+    dims: [ 77 ]
+  }
+]
+
+instance_group [
+  {
+    # Tokenisation is microsecond-scale — many copies on a few cores
+    # serve high QPS without saturating CPU.
+    count: 8
+    kind: KIND_CPU
+  }
+]
+
+# Tokenisation is fast enough that the queue delay matters more than
+# the batch size. 1 ms is enough to gather meaningful batches at any
+# realistic QPS.
+dynamic_batching {
+  preferred_batch_size: [ 32, 64, 128, 256 ]
+  max_queue_delay_microseconds: 1000
+}
+
+parameters: { key: "TOKENIZER" value: { string_value: "openai/clip-vit-base-patch32" } }
+parameters: { key: "MAX_LENGTH" value: { string_value: "77" } }
+parameters: { key: "TRUNCATION" value: { string_value: "true" } }
+
+# =============================================================================
+# Response cache: ON for text preprocess.
+# =============================================================================
+# Tokenisation is deterministic AND text queries repeat A LOT in
+# production search workloads ("red dress", "summer shoes" etc).
+# Cache hit rate is high; cache cost (a hash of the input string) is
+# negligible. Enable here AND start tritonserver with:
+#   --cache-config=local,size=1073741824
+response_cache { enable: true }
+
+version_policy { latest { num_versions: 1 } }
+
+parameters: { key: "stage"    value: { string_value: "preprocess" } }
+parameters: { key: "modality" value: { string_value: "text" } }

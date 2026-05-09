@@ -1,0 +1,79 @@
+# =============================================================================
+# clip_image_ensemble  —  end-to-end image-to-embedding endpoint
+# -----------------------------------------------------------------------------
+# The public-facing image path. Clients POST raw image bytes; Triton
+# pipes through preprocess → encoder GPU-to-GPU with no extra serialisation.
+#
+# Why a separate ensemble per modality (vs. one big ensemble that branches):
+#   - Ensembles are STATIC DAGs. Conditional logic ("did the client send
+#     an image or text?") needs BLS — see clip_router/config.pbtxt.
+#   - One ensemble per modality keeps each call path observable in metrics
+#     (`nv_inference_count{model="clip_image_ensemble"}`) without label
+#     gymnastics.
+# =============================================================================
+
+name: "clip_image_ensemble"
+
+# Special platform value — Triton's ensemble scheduler. No weights live
+# in 1/ (the directory may even be absent).
+platform: "ensemble"
+
+# Outer batch size — must be ≤ the smallest `max_batch_size` of any step
+# in the pipeline. clip_image_preprocess is 0 (unconstrained); encoder
+# is 64. We cap at 32 to match the TRT plan variant if used.
+max_batch_size: 32
+
+input [
+  { name: "image_bytes" data_type: TYPE_STRING dims: [ 1 ] }
+]
+output [
+  { name: "embedding"   data_type: TYPE_FP32   dims: [ 512 ] }
+]
+
+ensemble_scheduling {
+  step [
+    {
+      model_name: "clip_image_preprocess"
+      # `-1` = whatever this model's `version_policy` says is current
+      # (typically `latest`). Pin to a specific number for canarying.
+      model_version: -1
+      # input_map  : { key: <name in inner model> value: <name in outer / DAG> }
+      # output_map : { key: <name in inner model> value: <name in outer / DAG> }
+      # The OUTER name is either:
+      #   - this ensemble's `input`/`output` name, or
+      #   - an intermediate tensor name shared between steps.
+      input_map  { key: "image_bytes"  value: "image_bytes" }
+      output_map { key: "pixel_values" value: "tmp_pixel_values" }
+    },
+    {
+      # Swap to "clip_image_encoder_trt" for the TRT-plan variant — same
+      # I/O contract, ~2× throughput, but limited to specific GPU archs.
+      model_name: "clip_image_encoder"
+      model_version: -1
+      input_map  { key: "pixel_values" value: "tmp_pixel_values" }
+      output_map { key: "embedding"    value: "embedding" }
+    }
+  ]
+}
+
+# =============================================================================
+# Response cache on the ENSEMBLE.
+# =============================================================================
+# Big subtlety: when the cache fires here, BOTH inner steps are skipped.
+# The cache key hashes the ensemble's external inputs (image_bytes), so
+# this catches "same image submitted twice" — common when a UI re-fires
+# the search on focus or the client retries. Hit rate is lower than on
+# clip_text_encoder but the saving per hit is much bigger (skips the
+# entire pipeline, not just the encoder).
+response_cache { enable: true }
+
+# Ensembles inherit no scheduler config from their steps. Each step
+# batches independently — tune throughput at the step level, not here.
+
+# Note: this ensemble is NOT decoupled. A decoupled step (e.g. token
+# streaming) would force the ensemble to also be decoupled. CLIP is
+# fully synchronous — single request, single response.
+
+version_policy { latest { num_versions: 1 } }
+
+parameters: { key: "modality" value: { string_value: "image" } }

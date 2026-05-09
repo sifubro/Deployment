@@ -1,0 +1,98 @@
+# =============================================================================
+# clip_image_preprocess  —  Python backend, CPU
+# -----------------------------------------------------------------------------
+# Decodes raw image bytes (JPEG / PNG / WebP) and runs CLIPProcessor's
+# resize + center-crop + normalise pipeline on CPU. Output is a
+# [3, 224, 224] FP32 tensor ready for the image encoder.
+#
+# Why split this out instead of doing it on the GPU:
+#   - Image decoding is libjpeg/libpng work — pure CPU, branchy, hard
+#     to vectorise. GPU instances would idle while waiting for it.
+#   - CPU instances scale independently of GPU instances, so we can
+#     run 4× more decoders than encoders on a box where decoding is
+#     the bottleneck.
+# =============================================================================
+
+# `name` is optional — Triton derives it from the directory name. Pin it
+# explicitly so accidental directory renames fail loudly at load time.
+name: "clip_image_preprocess"
+
+# `backend` (not `platform`) for non-framework backends. The Python backend
+# loads `1/model.py` and calls its `initialize`, `execute`, `finalize`.
+#   backend  : python | tensorrtllm | vllm | dali | fil | openvino | <custom>
+#   platform : pytorch_libtorch | onnxruntime_onnx | tensorrt_plan |
+#              tensorflow_savedmodel | tensorflow_graphdef | ensemble
+backend: "python"
+
+# `max_batch_size: 0` means Triton does NOT add a batch dim. The model.py
+# handles requests one at a time (each request has one image). Set this
+# to a positive integer if your model.py loops over a stacked NumPy
+# array — image decoding is variable-cost per request, so naive
+# batching usually wastes work.
+max_batch_size: 0
+
+input [
+  {
+    name: "image_bytes"
+    # TYPE_STRING is how Triton ships raw bytes — each element is one
+    # opaque bytes blob (max 4 GiB). NumPy receives it as `dtype=object`.
+    data_type: TYPE_STRING
+    # `[1]` = exactly one image per request. Use `[-1]` to accept a
+    # variable number of images per request (NumPy will see a 1-D array
+    # whose length is the request size).
+    dims: [ 1 ]
+  }
+]
+
+output [
+  {
+    name: "pixel_values"
+    data_type: TYPE_FP32
+    # Fixed CLIP shape — declare it exactly so the ensemble step that
+    # consumes this can validate at load time, not at first request.
+    dims: [ 3, 224, 224 ]
+  }
+]
+
+# Each `instance_group` entry creates `count` parallel model copies that
+# can serve different requests concurrently.
+#   kind  : KIND_CPU | KIND_GPU | KIND_AUTO | KIND_MODEL
+#   gpus  : [0,1]   — pin to specific devices (omit = all visible)
+# CPU-bound work like image decoding benefits from many copies. Tune
+# `count` from observed queue depth at peak load — NOT from `nproc`.
+instance_group [
+  {
+    count: 4
+    kind: KIND_CPU
+  }
+]
+
+# `parameters` are free-form key/value strings handed to your backend.
+# Python backends read them in `initialize()` via:
+#   json.loads(args["model_config"])["parameters"]["<KEY>"]["string_value"]
+# Use this for ANY tunable so the same model.py works across
+# dev/staging/prod without code changes.
+parameters: { key: "HF_MODEL_NAME"  value: { string_value: "openai/clip-vit-base-patch32" } }
+parameters: { key: "RESIZE_SHORT_EDGE" value: { string_value: "224" } }
+# CLIP's normalisation constants — keep them in config so a swap to a
+# fine-tuned variant doesn't require re-baking the container.
+parameters: { key: "MEAN" value: { string_value: "0.48145466,0.4578275,0.40821073" } }
+parameters: { key: "STD"  value: { string_value: "0.26862954,0.26130258,0.27577711" } }
+
+# `version_policy` decides which numbered subdirs get loaded:
+#   latest { num_versions: 1 }   — only the highest (default)
+#   all {}                       — every version on disk (memory cost!)
+#   specific { versions: [1,3] } — pin exactly these
+version_policy { latest { num_versions: 1 } }
+
+# Response cache is OFF here even though preprocessing is deterministic.
+# The cache key is a hash of the input bytes, and image bytes in a real
+# product catalogue rarely repeat — hit rate is near zero, and the cache
+# slot is wasted. Cache LATER stages (the encoders) where many distinct
+# images have been seen before.
+response_cache { enable: false }
+
+# Prometheus labels appended to every metric this model emits. Lets you
+# slice Grafana dashboards by stage / modality.
+parameters: { key: "stage"    value: { string_value: "preprocess" } }
+parameters: { key: "modality" value: { string_value: "image" } }

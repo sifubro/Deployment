@@ -1,0 +1,54 @@
+# =============================================================================
+# vlm_postprocess  —  Python backend, CPU
+# -----------------------------------------------------------------------------
+# Detokenises generated token IDs back to text. Trivial CPU work, but it's
+# the perfect place to demonstrate `response_cache` (deterministic) and
+# `version_policy: all` (multi-version load for blue/green rollouts).
+# =============================================================================
+
+name: "vlm_postprocess"
+backend: "python"
+
+max_batch_size: 64
+
+input [
+  { name: "token_ids"  data_type: TYPE_INT32  dims: [ -1 ] }
+]
+output [
+  { name: "text"       data_type: TYPE_STRING  dims: [ 1 ] }
+]
+
+instance_group [
+  { count: 2  kind: KIND_CPU }
+]
+
+dynamic_batching {
+  preferred_batch_size: [ 8, 16, 32, 64 ]
+  # Postprocess is fast (microseconds), so a tiny queue delay still lets
+  # us assemble decent batches without adding noticeable latency.
+  max_queue_delay_microseconds: 1000
+}
+
+# =============================================================================
+# Response cache — Triton hashes (model_name + version + inputs) and
+# returns the cached output if hit. ONLY safe for deterministic models.
+# Detokenisation IS deterministic (same token ids → same text), so it's
+# a textbook fit.
+#
+# To activate, ALSO start tritonserver with:
+#   --cache-config=local,size=1073741824
+# or with the redis cache implementation for multi-replica deployments:
+#   --cache-config=redis,host=...,size=...
+# =============================================================================
+response_cache { enable: true }
+
+# `all {}` keeps every numbered subdirectory loaded simultaneously. Lets
+# clients pin a specific version per request via the `model_version`
+# header — essential for blue/green rollouts and for shadow-traffic A/B
+# testing. Costs one model's RAM per extra version, so use sparingly.
+version_policy { all {} }
+
+# Pass the tokenizer choice as a parameter — same model.py works for any
+# tokeniser we throw at it.
+parameters: { key: "TOKENIZER" value: { string_value: "meta-llama/Llama-2-7b-hf" } }
+parameters: { key: "SKIP_SPECIAL_TOKENS" value: { string_value: "true" } }

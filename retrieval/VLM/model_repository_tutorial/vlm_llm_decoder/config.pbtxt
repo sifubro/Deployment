@@ -1,0 +1,148 @@
+# =============================================================================
+# vlm_llm_decoder  —  decoupled streaming LLM
+# -----------------------------------------------------------------------------
+# Receives the image features + prompt embeddings and emits tokens one at
+# a time. The interesting bit here is `model_transaction_policy.decoupled`,
+# which lets a single request produce N responses (token streaming) or
+# zero responses (cancellation).
+#
+# In real production this `backend` is `tensorrtllm` or `vllm`. We use
+# `python` here so the config is self-contained.
+# =============================================================================
+
+name: "vlm_llm_decoder"
+backend: "python"
+
+# =============================================================================
+# Decoupled mode — required for token streaming.
+# -----------------------------------------------------------------------------
+# Without this, Triton enforces the synchronous 1-request → 1-response
+# contract. With it, your model.py uses `response_sender.send(response,
+# flags=...)` and can emit:
+#   - many partial responses (e.g. one token at a time)
+#   - a final response with `pb_utils.TRITONSERVER_RESPONSE_COMPLETE_FINAL`
+#   - zero responses (request was cancelled)
+# Clients receive the stream over gRPC bidi-streaming or HTTP/SSE.
+# =============================================================================
+model_transaction_policy {
+  decoupled: true
+}
+
+# `max_batch_size: 0` because LLMs can't be naively stacked — each request
+# has its own KV-cache state, prompt length, and generation budget.
+# Production LLM backends (TensorRT-LLM, vLLM) do CONTINUOUS / IN-FLIGHT
+# batching internally and still set this to 0.
+max_batch_size: 0
+
+input [
+  {
+    name: "image_features"
+    data_type: TYPE_FP32
+    dims: [ 257, 768 ]
+  },
+  {
+    name: "input_ids"
+    data_type: TYPE_INT64
+    dims: [ -1 ]
+  },
+  # Sampling controls — all optional so clients can rely on server defaults.
+  {
+    name: "max_new_tokens"
+    data_type: TYPE_INT32
+    dims: [ 1 ]
+    optional: true
+  },
+  {
+    name: "temperature"
+    data_type: TYPE_FP32
+    dims: [ 1 ]
+    optional: true
+  },
+  {
+    name: "top_p"
+    data_type: TYPE_FP32
+    dims: [ 1 ]
+    optional: true
+  },
+  {
+    name: "stream"
+    data_type: TYPE_BOOL
+    dims: [ 1 ]
+    optional: true
+  }
+]
+
+output [
+  {
+    # Token IDs — postprocess detokenises these to text. Emit one token
+    # per response in streaming mode, or the full sequence in non-streaming.
+    name: "output_token_ids"
+    data_type: TYPE_INT32
+    dims: [ -1 ]
+  },
+  {
+    # Set to true on the final response so the client doesn't need to
+    # parse gRPC trailers to know the stream is over.
+    name: "is_final"
+    data_type: TYPE_BOOL
+    dims: [ 1 ]
+  }
+]
+
+instance_group [
+  # ONE instance per GPU is the right default for big LLMs — extra copies
+  # multiply weight memory without helping latency (the GPU is already
+  # saturated by one instance's continuous batching).
+  { count: 1  kind: KIND_GPU  gpus: [ 0 ] }
+]
+
+# =============================================================================
+# Engine + tokenizer paths (read in your model.py's `initialize`).
+# In a real deployment with the `tensorrtllm` backend, these become things
+# like `gpt_model_path`, `gpt_model_type`, `kv_cache_free_gpu_mem_fraction`,
+# `enable_chunked_context`, `batch_scheduler_policy`, etc.
+# =============================================================================
+parameters: { key: "ENGINE_DIR"        value: { string_value: "/models/vlm_llm_decoder/1/engine" } }
+parameters: { key: "TOKENIZER"         value: { string_value: "meta-llama/Llama-2-7b-hf" } }
+parameters: { key: "MAX_BATCH_TOKENS"  value: { string_value: "8192" } }
+parameters: { key: "DEFAULT_TEMPERATURE" value: { string_value: "0.7" } }
+parameters: { key: "DEFAULT_MAX_NEW_TOKENS" value: { string_value: "256" } }
+
+# Skip response cache for sampling LLMs — outputs are stochastic, caching
+# them would return the same continuation for a given prompt forever.
+response_cache { enable: false }
+
+version_policy { latest { num_versions: 1 } }
+
+# =============================================================================
+# Alternative: stateful sessions via `sequence_batching`
+# -----------------------------------------------------------------------------
+# If you implement KV cache as Triton-managed state (instead of inside a
+# specialised LLM backend), you'd replace `dynamic_batching` with the
+# block below. Triton routes all requests sharing a `correlation_id` to
+# the SAME instance and slot, preserving the KV cache between turns.
+#
+# Real LLM serving (TRT-LLM, vLLM) handles KV cache INSIDE the backend
+# and uses neither dynamic_batching nor sequence_batching here — they
+# expose it via custom inputs/outputs.
+# =============================================================================
+# sequence_batching {
+#   max_sequence_idle_microseconds: 5000000     # close idle sessions after 5s
+#   oldest {                                     # or `direct {}` for strict per-slot
+#     max_candidate_sequences: 8
+#     preferred_batch_size: [ 4, 8 ]
+#     max_queue_delay_microseconds: 1000
+#   }
+#   control_input [
+#     { name: "START"   control [{ kind: CONTROL_SEQUENCE_START   fp32_false_true: [0,1] }] },
+#     { name: "READY"   control [{ kind: CONTROL_SEQUENCE_READY   fp32_false_true: [0,1] }] },
+#     { name: "END"     control [{ kind: CONTROL_SEQUENCE_END     fp32_false_true: [0,1] }] },
+#     { name: "CORRID"  control [{ kind: CONTROL_SEQUENCE_CORRID  data_type: TYPE_UINT64 }] }
+#   ]
+#   state [                                      # Triton-managed KV cache
+#     { input_name: "kv_in"  output_name: "kv_out"
+#       data_type: TYPE_FP16  dims: [ -1, 4096 ]
+#       initial_state [{ data_type: TYPE_FP16 dims: [0,4096] zero_data: true name: "init" }]
+#     }
+#   ]
+# }

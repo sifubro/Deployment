@@ -1,0 +1,107 @@
+# =============================================================================
+# vlm_preprocess  —  Python backend, CPU
+# -----------------------------------------------------------------------------
+# Decodes the raw JPEG/PNG bytes the client sent and tokenises the text prompt
+# BEFORE either touches the GPU. Splitting this out keeps the GPU instances
+# focused on tensor math and lets us scale CPU-bound work independently.
+# =============================================================================
+
+# `name` is optional — Triton derives it from the directory if omitted —
+# but pinning it explicitly makes accidental directory renames fail loudly
+# at load time instead of silently registering a model under the wrong name.
+name: "vlm_preprocess"
+
+# Use `backend` (not `platform`) for any non-framework backend.
+#   backend  : python | tensorrtllm | vllm | dali | fil | openvino | <custom>
+#   platform : pytorch_libtorch | onnxruntime_onnx | tensorrt_plan |
+#              tensorflow_savedmodel | tensorflow_graphdef | ensemble
+# Pick exactly one.
+backend: "python"
+
+# `max_batch_size: 0` means "do NOT prepend a batch dim". Inputs arrive in
+# the exact shape declared under `dims`. We use 0 here because:
+#   1. The Python code processes one request at a time anyway.
+#   2. Image preprocessing is variable-cost per request (different decoders,
+#      EXIF rotation, resize math) — naive batching wastes work.
+# Set this to a positive integer (e.g. 32) if your model.py truly batches.
+max_batch_size: 0
+
+input [
+  {
+    # Names here MUST match what your model.py looks up via
+    # `pb_utils.get_input_tensor_by_name(request, "image_bytes")`.
+    name: "image_bytes"
+    # TYPE_STRING is how Triton ships raw bytes — each element is one
+    # opaque bytes blob (max 4 GiB). NumPy receives it as `dtype=object`.
+    data_type: TYPE_STRING
+    # `[1]` = exactly one image per request. Use `[-1]` if a single
+    # request can carry a variable number of images.
+    dims: [ 1 ]
+  },
+  {
+    name: "prompt"
+    data_type: TYPE_STRING
+    dims: [ 1 ]
+    # `optional: true` lets clients omit this input entirely. Useful when
+    # the same model serves both image-only ("describe this") and
+    # image+question ("what colour is the car?") traffic.
+    optional: true
+  }
+]
+
+output [
+  {
+    name: "pixel_values"
+    data_type: TYPE_FP32
+    # Declare exact shapes whenever you know them — Triton validates at
+    # load time and the ensemble step that consumes this can be checked
+    # at config-load instead of at first request.
+    dims: [ 3, 224, 224 ]
+  },
+  {
+    name: "input_ids"
+    data_type: TYPE_INT64
+    # `-1` = variable along this axis. The LLM decoder downstream must be
+    # written to accept variable seq lengths or you must pad/truncate here.
+    dims: [ -1 ]
+  },
+  {
+    name: "attention_mask"
+    data_type: TYPE_INT64
+    dims: [ -1 ]
+  }
+]
+
+# Each `instance_group` entry creates `count` parallel model copies that
+# can serve different requests concurrently.
+#   kind  : KIND_CPU | KIND_GPU | KIND_AUTO | KIND_MODEL
+#   gpus  : [0,1]   — pin to specific devices (omit = all visible)
+# CPU-bound preprocessing benefits from multiple instances; tune `count`
+# from p99 latency under realistic load, NOT from `nproc`.
+instance_group [
+  {
+    count: 4
+    kind: KIND_CPU
+  }
+]
+
+# `parameters` are free-form key/value strings handed to your backend.
+# Python backends read them in `initialize()` via
+# `json.loads(args["model_config"])["parameters"]`. Use this for ANY
+# tunable (model name, max length, paths) so the same model.py works
+# across dev/staging/prod without code changes.
+parameters: { key: "HF_MODEL_NAME"   value: { string_value: "openai/clip-vit-base-patch32" } }
+parameters: { key: "MAX_TEXT_LENGTH" value: { string_value: "77" } }
+parameters: { key: "RESIZE_SHORT_EDGE" value: { string_value: "256" } }
+
+# `version_policy` decides which subdirectories under this model's folder
+# get loaded:
+#   latest { num_versions: 1 }   — only the highest-numbered (default)
+#   all {}                       — every version on disk (memory cost!)
+#   specific { versions: [1,3] } — pin exactly these
+# `latest 1` is the right default for stateless utility models.
+version_policy { latest { num_versions: 1 } }
+
+# Extra labels appended to every Prometheus metric this model emits.
+# Lets you slice Grafana dashboards by stage / tenant / family.
+parameters: { key: "stage"  value: { string_value: "preprocess" } }
