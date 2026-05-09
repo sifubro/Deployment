@@ -1,4 +1,4 @@
-
+https://docs.google.com/document/d/1PMTcYo3Dkm2OdoabOXlumnLI0X60Pz-x4-mN-nemnzo/edit?tab=t.0
 
 https://claude.ai/chat/f4da7b9d-e570-4e41-992c-0f78a12e9c97
 
