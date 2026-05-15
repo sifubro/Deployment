@@ -32,6 +32,7 @@ model = Model(
     name="depop-embedder",
 )
 
+predictor = None
 try:
     predictor = model.deploy(
         initial_instance_count=1,
@@ -39,5 +40,6 @@ try:
         endpoint_name="depop-embedder-endpoint",
     )
 finally:
-    predictor.delete_endpoint()
-    print("Endpoint deleted.")
+    if predictor is not None:
+        predictor.delete_endpoint()
+        print("Endpoint deleted.")

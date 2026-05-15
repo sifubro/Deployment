@@ -20,4 +20,9 @@ RUN python -c "from embedder import ResNetEmbedder; ResNetEmbedder()"
 
 EXPOSE 8080
 
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8080", "--workers", "1"]
+# SageMaker invokes the container as `docker run <image> serve`.
+# The serve script must be on PATH so that call resolves correctly.
+RUN printf '#!/bin/bash\nexec uvicorn app:app --host 0.0.0.0 --port 8080 --workers 1\n' > /opt/program/serve \
+    && chmod +x /opt/program/serve
+
+ENV PATH="/opt/program:${PATH}"
